@@ -20,6 +20,12 @@ import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { createMemoryCLI } from "./cli.js";
 
+// Import smart extraction & lifecycle components
+import { SmartExtractor } from "./src/smart-extractor.js";
+import { createLlmClient } from "./src/llm-client.js";
+import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
+import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
+
 // ============================================================================
 // Configuration & Types
 // ============================================================================
@@ -27,7 +33,7 @@ import { createMemoryCLI } from "./cli.js";
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey: string | string[];
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -60,6 +66,15 @@ interface PluginConfig {
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
   };
+  // Smart extraction config (Phase 1: from epro-memory)
+  smartExtraction?: boolean;
+  llm?: {
+    apiKey?: string;
+    model?: string;
+    baseURL?: string;
+  };
+  extractMinMessages?: number;
+  extractMaxChars?: number;
   scopes?: {
     default?: string;
     definitions?: Record<string, { description: string }>;
@@ -398,10 +413,19 @@ const memoryLanceDBProPlugin = {
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
     });
-    const retriever = createRetriever(store, embedder, {
-      ...DEFAULT_RETRIEVAL_CONFIG,
-      ...config.retrieval,
-    });
+    // Initialize decay engine + tier manager (lifecycle scoring)
+    const decayEngine = createDecayEngine(DEFAULT_DECAY_CONFIG);
+    const tierManager = createTierManager(DEFAULT_TIER_CONFIG);
+
+    const retriever = createRetriever(
+      store,
+      embedder,
+      {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config.retrieval,
+      },
+      { decayEngine, tierManager },
+    );
 
     // Access reinforcement tracker (debounced write-back)
     const accessTracker = new AccessTracker({
@@ -414,17 +438,46 @@ const memoryLanceDBProPlugin = {
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
 
+    // Initialize smart extraction (Phase 1: from epro-memory)
+    let smartExtractor: SmartExtractor | null = null;
+    if (config.smartExtraction !== false) {
+      try {
+        const embeddingKey = Array.isArray(config.embedding.apiKey)
+          ? config.embedding.apiKey[0]
+          : config.embedding.apiKey;
+        const llmApiKey = config.llm?.apiKey
+          ? resolveEnvVars(config.llm.apiKey)
+          : resolveEnvVars(embeddingKey);
+        const llmBaseURL = config.llm?.baseURL
+          ? resolveEnvVars(config.llm.baseURL)
+          : config.embedding.baseURL;
+        const llmModel = config.llm?.model || "gpt-4o-mini";
+
+        const llmClient = createLlmClient({
+          apiKey: llmApiKey,
+          model: llmModel,
+          baseURL: llmBaseURL,
+          timeoutMs: 30000,
+        });
+
+        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+          user: "User",
+          extractMinMessages: config.extractMinMessages ?? 4,
+          extractMaxChars: config.extractMaxChars ?? 8000,
+          defaultScope: config.scopes?.default ?? "global",
+          log: (msg: string) => api.logger.info(msg),
+        });
+
+        api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ")");
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      }
+    }
+
     const pluginVersion = getPluginVersion();
 
-    // Session-based recall history to prevent redundant injections
-    // Map<sessionId, Map<memoryId, turnIndex>>
-    const recallHistory = new Map<string, Map<string, number>>();
-
-    // Map<sessionId, turnCounter> - manual turn tracking per session
-    const turnCounter = new Map<string, number>();
-
     api.logger.info(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
+      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? "ON" : "OFF"})`,
     );
 
     // ========================================================================
@@ -475,11 +528,6 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
-        // Manually increment turn counter for this session
-        const sessionId = ctx?.sessionId || "default";
-        const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
-        turnCounter.set(sessionId, currentTurn);
-
         try {
           // Determine agent ID and accessible scopes
           const agentId = ctx?.agentId || "main";
@@ -496,54 +544,23 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
-          // Filter out redundant memories based on session history
-          const minRepeated = config.autoRecallMinRepeated ?? 0;
-
-          // Only enable dedup logic when minRepeated > 0
-          let finalResults = results;
-
-          if (minRepeated > 0) {
-            const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
-            const filteredResults = results.filter((r) => {
-              const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
-              const diff = currentTurn - lastTurn;
-              const isRedundant = diff < minRepeated;
-
-              if (isRedundant) {
-                api.logger.debug?.(
-                  `memory-lancedb-pro: skipping redundant memory ${r.entry.id.slice(0, 8)} (last seen at turn ${lastTurn}, current turn ${currentTurn}, min ${minRepeated})`,
-                );
-              }
-              return !isRedundant;
-            });
-
-            if (filteredResults.length === 0) {
-              if (results.length > 0) {
-                api.logger.info?.(
-                  `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
-                );
-              }
-              return;
-            }
-
-            // Update history with successfully injected memories
-            for (const r of filteredResults) {
-              sessionHistory.set(r.entry.id, currentTurn);
-            }
-            recallHistory.set(sessionId, sessionHistory);
-
-            finalResults = filteredResults;
-          }
-
-          const memoryContext = finalResults
-            .map(
-              (r) =>
-                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
-            )
+          // Format with L0 abstracts grouped by category when available
+          const memoryContext = results
+            .map((r) => {
+              let metaObj: Record<string, unknown> = {};
+              try {
+                metaObj = JSON.parse(r.entry.metadata || "{}");
+              } catch {}
+              const displayCategory = (metaObj.memory_category as string) || r.entry.category;
+              const displayTier = (metaObj.tier as string) || "";
+              const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
+              const abstract = (metaObj.l0_abstract as string) || r.entry.text;
+              return `- ${tierPrefix}[${displayCategory}:${r.entry.scope}] ${sanitizeForContext(abstract)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`;
+            })
             .join("\n");
 
           api.logger.info?.(
-            `memory-lancedb-pro: injecting ${finalResults.length} memories into context for agent ${agentId}`,
+            `memory-lancedb-pro: injecting ${results.length} memories into context for agent ${agentId}`,
           );
 
           return {
@@ -612,7 +629,29 @@ const memoryLanceDBProPlugin = {
             }
           }
 
-          // Filter for capturable content
+          // ----------------------------------------------------------------
+          // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
+          // ----------------------------------------------------------------
+          if (smartExtractor) {
+            const minMessages = config.extractMinMessages ?? 4;
+            if (texts.length >= minMessages) {
+              const conversationText = texts.join("\n");
+              const sessionKey = (event as any).sessionKey || "unknown";
+              const stats = await smartExtractor.extractAndPersist(
+                conversationText, sessionKey,
+              );
+              if (stats.created > 0 || stats.merged > 0) {
+                api.logger.info(
+                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
+                );
+              }
+              return; // Smart extraction handled everything
+            }
+          }
+
+          // ----------------------------------------------------------------
+          // Fallback: regex-triggered capture (original logic)
+          // ----------------------------------------------------------------
           const toCapture = texts.filter((text) => text && shouldCapture(text));
           if (toCapture.length === 0) {
             return;
@@ -625,17 +664,9 @@ const memoryLanceDBProPlugin = {
             const vector = await embedder.embedPassage(text);
 
             // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-            // Fail-open by design: dedup should not block auto-capture writes.
-            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
-            try {
-              existing = await store.vectorSearch(vector, 1, 0.1, [
-                defaultScope,
-              ]);
-            } catch (err) {
-              api.logger.warn(
-                `memory-lancedb-pro: auto-capture duplicate pre-check failed, continue store: ${String(err)}`,
-              );
-            }
+            const existing = await store.vectorSearch(vector, 1, 0.1, [
+              defaultScope,
+            ]);
 
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
@@ -992,6 +1023,11 @@ function parsePluginConfig(value: unknown): PluginConfig {
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (cfg.retrieval as any)
         : undefined,
+    // Smart extraction config (Phase 1)
+    smartExtraction: cfg.smartExtraction !== false, // Default ON
+    llm: typeof cfg.llm === "object" && cfg.llm !== null ? (cfg.llm as any) : undefined,
+    extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes:
       typeof cfg.scopes === "object" && cfg.scopes !== null
         ? (cfg.scopes as any)

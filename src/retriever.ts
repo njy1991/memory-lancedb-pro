@@ -3,7 +3,7 @@
  * Combines vector search + BM25 full-text search with RRF fusion
  */
 
-import type { MemoryStore, MemorySearchResult } from "./store.js";
+import type { MemoryEntry, MemoryStore, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
 import {
@@ -11,6 +11,11 @@ import {
   parseAccessMetadata,
   computeEffectiveHalfLife,
 } from "./access-tracker.js";
+
+// Smart lifecycle scoring (decay + tier)
+import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
+import type { TierManager } from "./tier-manager.js";
+import type { MemoryTier } from "./memory-categories.js";
 
 // ============================================================================
 // Types & Configuration
@@ -125,6 +130,54 @@ function clampInt(value: number, min: number, max: number): number {
 function clamp01(value: number, fallback: number): number {
   if (!Number.isFinite(value)) return Number.isFinite(fallback) ? fallback : 0;
   return Math.min(1, Math.max(0, value));
+}
+
+function parseJsonObject(metadata?: string): Record<string, unknown> {
+  if (!metadata || typeof metadata !== "string") return {};
+  try {
+    const obj = JSON.parse(metadata);
+    return (obj && typeof obj === "object") ? (obj as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseMemoryTier(raw: unknown, fallback: MemoryTier = "working"): MemoryTier {
+  const v = typeof raw === "string" ? raw.toLowerCase().trim() : "";
+  if (v === "core" || v === "working" || v === "peripheral") return v;
+  return fallback;
+}
+
+function parseNumber(raw: unknown, fallback: number): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getDecayableFromEntry(entry: MemoryEntry): { memory: DecayableMemory; meta: Record<string, unknown> } {
+  const meta = parseJsonObject(entry.metadata);
+
+  // Support both snake_case and camelCase keys for interoperability.
+  const accessCount = parseNumber(meta.access_count ?? meta.accessCount, 0);
+  const createdAt = parseNumber(meta.created_at ?? meta.createdAt, entry.timestamp);
+  const lastAccessedAt = parseNumber(
+    meta.last_accessed_at ?? meta.lastAccessedAt,
+    createdAt,
+  );
+  const confidence = clamp01(parseNumber(meta.confidence, 0.7), 0.7);
+  const tier = parseMemoryTier(meta.tier, "working");
+
+  return {
+    memory: {
+      id: entry.id,
+      importance: clamp01(entry.importance, 0.5),
+      confidence,
+      tier,
+      accessCount: Math.max(0, Math.floor(accessCount)),
+      createdAt,
+      lastAccessedAt,
+    },
+    meta,
+  };
 }
 
 // ============================================================================
@@ -286,6 +339,8 @@ export class MemoryRetriever {
     private store: MemoryStore,
     private embedder: Embedder,
     private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
+    private decayEngine?: DecayEngine,
+    private tierManager?: TierManager,
   ) {}
 
   setAccessTracker(tracker: AccessTracker): void {
@@ -354,7 +409,8 @@ export class MemoryRetriever {
     const weighted = this.applyImportanceWeight(boosted);
     const lengthNormalized = this.applyLengthNormalization(weighted);
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    const hardFiltered = timeDecayed.filter(
+    const lifecycleBoosted = this.applyLifecycleBoost(timeDecayed);
+    const hardFiltered = lifecycleBoosted.filter(
       (r) => r.score >= this.config.hardMinScore,
     );
     const denoised = this.config.filterNoise
@@ -422,8 +478,11 @@ export class MemoryRetriever {
     // Apply time decay (penalize stale entries)
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
 
+    // Apply lifecycle-aware decay/tier boost
+    const lifecycleBoosted = this.applyLifecycleBoost(timeDecayed);
+
     // Hard minimum score cutoff (post all scoring stages)
-    const hardFiltered = timeDecayed.filter(
+    const hardFiltered = lifecycleBoosted.filter(
       (r) => r.score >= this.config.hardMinScore,
     );
 
@@ -802,6 +861,83 @@ export class MemoryRetriever {
   }
 
   /**
+   * Apply lifecycle-aware score adjustment (decay + tier floors).
+   *
+   * This is intentionally lightweight:
+   * - reads tier/access metadata (if any)
+   * - multiplies scores by max(tierFloor, decayComposite)
+   */
+  private applyLifecycleBoost(results: RetrievalResult[]): RetrievalResult[] {
+    if (!this.decayEngine) return results;
+
+    const now = Date.now();
+    const pairs = results.map(r => {
+      const { memory } = getDecayableFromEntry(r.entry);
+      return { r, memory };
+    });
+
+    const scored = pairs.map(p => ({ memory: p.memory, score: p.r.score }));
+    this.decayEngine.applySearchBoost(scored, now);
+
+    const boosted = pairs.map((p, i) => ({ ...p.r, score: scored[i].score }));
+    return boosted.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Record access stats (access_count, last_accessed_at) and apply tier
+   * promotion/demotion for a small number of top results.
+   *
+   * Note: this writes back to LanceDB via delete+readd; keep it bounded.
+   */
+  private async recordAccessAndMaybeTransition(results: RetrievalResult[]): Promise<void> {
+    if (!this.decayEngine && !this.tierManager) return;
+
+    const now = Date.now();
+    const toUpdate = results.slice(0, 3);
+
+    for (const r of toUpdate) {
+      const { memory, meta } = getDecayableFromEntry(r.entry);
+
+      // Update access stats in-memory first
+      const nextAccess = memory.accessCount + 1;
+      meta.access_count = nextAccess;
+      meta.last_accessed_at = now;
+      if (meta.created_at === undefined && meta.createdAt === undefined) {
+        meta.created_at = memory.createdAt;
+      }
+      if (meta.tier === undefined) {
+        meta.tier = memory.tier;
+      }
+      if (meta.confidence === undefined) {
+        meta.confidence = memory.confidence;
+      }
+
+      const updatedMemory: DecayableMemory = {
+        ...memory,
+        accessCount: nextAccess,
+        lastAccessedAt: now,
+      };
+
+      // Tier transition (optional)
+      if (this.decayEngine && this.tierManager) {
+        const ds = this.decayEngine.score(updatedMemory, now);
+        const transition = this.tierManager.evaluate(updatedMemory, ds, now);
+        if (transition) {
+          meta.tier = transition.toTier;
+        }
+      }
+
+      try {
+        await this.store.update(r.entry.id, {
+          metadata: JSON.stringify(meta),
+        });
+      } catch {
+        // best-effort: ignore
+      }
+    }
+  }
+
+  /**
    * MMR-inspired diversity filter: greedily select results that are both
    * relevant (high score) and diverse (low similarity to already-selected).
    *
@@ -890,11 +1026,23 @@ export class MemoryRetriever {
 // Factory Function
 // ============================================================================
 
+export interface RetrieverLifecycleOptions {
+  decayEngine?: DecayEngine;
+  tierManager?: TierManager;
+}
+
 export function createRetriever(
   store: MemoryStore,
   embedder: Embedder,
   config?: Partial<RetrievalConfig>,
+  lifecycle?: RetrieverLifecycleOptions,
 ): MemoryRetriever {
   const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
-  return new MemoryRetriever(store, embedder, fullConfig);
+  return new MemoryRetriever(
+    store,
+    embedder,
+    fullConfig,
+    lifecycle?.decayEngine,
+    lifecycle?.tierManager,
+  );
 }
